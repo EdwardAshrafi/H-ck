@@ -103,8 +103,8 @@ Private currentKind As Long, currentDUni As Double
 Private swApp As Object, swModel As Object, swMath As Object
 Private planeFront As Object, planeTop As Object, planeRight As Object
 Private curSketch As Object, curXform As Object, curArcFlip As Boolean
-Private curPlane As Long, sketchStartCount As Long, planeSelInfo As String
-Private keepViewOn As Boolean, planeByName As Boolean, flatZ As Boolean, noAddToDB As Boolean
+Private curPlane As Long, planeSelInfo As String
+Private xfMode As Long, xfA(0 To 15) As Double, xfLogged(0 To 3) As Boolean
 Private lastFeat As Object, lastCenterline As Object
 Private offCombo(1 To 3) As Long
 Private TestMode As Boolean, testFile As Integer
@@ -1193,12 +1193,10 @@ Private Sub SW_NewPart()
     If swModel Is Nothing Then Err.Raise ERR_STEM + 21, , "SolidWorks could not open a new part from " & tpl
     FindDefaultPlanes
     On Error Resume Next
-    swModel.SketchManager.AddToDB = Not noAddToDB
-    swModel.SketchManager.DisplayWhenAdded = keepViewOn
-    If Not keepViewOn Then
-        swModel.FeatureManager.EnableFeatureTree = False
-        swModel.ActiveView.EnableGraphicsUpdate = False
-    End If
+    swModel.SketchManager.AddToDB = True
+    swModel.SketchManager.DisplayWhenAdded = False
+    swModel.FeatureManager.EnableFeatureTree = False
+    swModel.ActiveView.EnableGraphicsUpdate = False
     On Error GoTo 0
 End Sub
 
@@ -1257,10 +1255,13 @@ Private Sub SW_BeginSketchPlane(ByVal which As Long)
         Exit Sub
     End If
     curPlane = which
-    sketchStartCount = swModel.GetFeatureCount
     If Not SelectPlane(which) Then Err.Raise ERR_STEM + 29, , "The " & PlaneLabel(which) & " plane could not be selected. " & planeSelInfo
     swModel.SketchManager.InsertSketch True
-    PrepareSketchTransform
+    Select Case which
+    Case 1: PrepareSketchTransform 0, 0, 0, 0, 0, 1
+    Case 2: PrepareSketchTransform 0, 0, 0, 0, 1, 0
+    Case Else: PrepareSketchTransform 0, 0, 0, 1, 0, 0
+    End Select
 End Sub
 
 Private Function PlaneObj(ByVal which As Long) As Object
@@ -1276,24 +1277,22 @@ Private Function PlaneLabel(ByVal which As Long) As String
 End Function
 
 ' Selects a default plane and checks that something really is selected. Picking the plane by
-' name is the fallback, and becomes the first choice once it has been needed.
+' name is the fallback.
 Private Function SelectPlane(ByVal which As Long) As Boolean
     Dim p As Object, ok As Boolean, nSel As Long
     Set p = PlaneObj(which)
-    ok = False: planeSelInfo = ""
+    ok = False
     On Error Resume Next
     swModel.ClearSelection2 True
-    If Not planeByName Then
-        ok = p.Select2(False, 0)
-        nSel = swModel.SelectionManager.GetSelectedObjectCount2(-1)
-        planeSelInfo = "'" & p.Name & "' Select2 gave " & ok & " with " & nSel & " selected."
-        ok = ok And nSel > 0
-    End If
+    ok = p.Select2(False, 0)
+    nSel = swModel.SelectionManager.GetSelectedObjectCount2(-1)
+    planeSelInfo = "'" & p.Name & "' Select2 gave " & ok & " with " & nSel & " selected."
+    ok = ok And nSel > 0
     If Not ok Then
         swModel.ClearSelection2 True
         ok = swModel.Extension.SelectByID2(p.Name, "PLANE", 0, 0, 0, False, 0, Nothing, 0)
         nSel = swModel.SelectionManager.GetSelectedObjectCount2(-1)
-        planeSelInfo = planeSelInfo & " '" & p.Name & "' SelectByID2 gave " & ok & " with " & nSel & " selected."
+        planeSelInfo = planeSelInfo & " SelectByID2 gave " & ok & " with " & nSel & " selected."
         ok = ok And nSel > 0
     End If
     Err.Clear
@@ -1311,7 +1310,6 @@ Private Function SW_BeginSketchOnFace(ByVal x As Double, ByVal y As Double, ByVa
         Exit Function
     End If
     curPlane = 0
-    sketchStartCount = swModel.GetFeatureCount
     planeSelInfo = "a face of the part."
     swModel.ClearSelection2 True
     If Not SelectFace(x, y, z, dx, dy, dz, False, 0) Then
@@ -1319,7 +1317,8 @@ Private Function SW_BeginSketchOnFace(ByVal x As Double, ByVal y As Double, ByVa
         Exit Function
     End If
     swModel.SketchManager.InsertSketch True
-    PrepareSketchTransform
+    ' the outward normal of the face points back along the ray
+    PrepareSketchTransform x, y, z, -dx, -dy, -dz
     SW_BeginSketchOnFace = True
 End Function
 
@@ -1343,29 +1342,137 @@ Private Function SelectFace(ByVal x As Double, ByVal y As Double, ByVal z As Dou
     SelectFace = ok
 End Function
 
-Private Sub PrepareSketchTransform()
+' Works out how model points become sketch points in the open sketch. SolidWorks' own transform
+' is tried first. SolidWorks 2026 (revision 34.4.1) has been seen to map every point to the
+' sketch origin, so the transform matrix is then applied directly, and on the default planes
+' their fixed layout is the last resort. (px, py, pz) is a point on the sketch plane and
+' (nx, ny, nz) its outward normal, which SolidWorks makes the sketch +Z.
+Private Sub PrepareSketchTransform(ByVal px As Double, ByVal py As Double, ByVal pz As Double, _
+                                   ByVal nx As Double, ByVal ny As Double, ByVal nz As Double)
     Dim ox As Double, oy As Double, oz As Double, ax As Double, ay As Double, az As Double
-    Dim bx As Double, by As Double, bz As Double
+    Dim bx As Double, by As Double, bz As Double, v As Variant, k As Long, mode As Long, lastMode As Long
+    Dim found As Boolean
     Set curSketch = swModel.SketchManager.ActiveSketch
     If curSketch Is Nothing Then Err.Raise ERR_STEM + 23, , "No active sketch after InsertSketch."
     ForceAddToDB
+    Set curXform = Nothing
+    For k = 0 To 15
+        xfA(k) = 0
+    Next k
+    On Error Resume Next
     Set curXform = curSketch.ModelToSketchTransform
+    v = curXform.ArrayData
+    For k = 0 To 15
+        xfA(k) = v(k)
+    Next k
+    Err.Clear
+    On Error GoTo 0
+    If curPlane > 0 Then lastMode = 3 Else lastMode = 2
+    found = False
+    For mode = 0 To lastMode
+        If TransformOK(mode, px, py, pz, nx, ny, nz) Then
+            found = True
+            Exit For
+        End If
+    Next mode
+    If Not found Then Err.Raise ERR_STEM + 31, , "No usable model-to-sketch transform for the sketch on " & _
+        planeSelInfo & " " & XformText()
+    If xfMode > 0 And Not xfLogged(curPlane) Then
+        xfLogged(curPlane) = True
+        WriteLog "  SolidWorks' sketch transform on " & SketchSurfaceName() & " is unusable, so method " & xfMode & _
+            " (" & Choose(xfMode, "matrix by rows", "matrix by columns", "fixed plane layout") & ") is used. " & XformText()
+    End If
     ToSketch 0, 0, 0, ox, oy, oz
     ToSketch 1, 0, 0, ax, ay, az
     ToSketch 0, 1, 0, bx, by, bz
     curArcFlip = ((ax - ox) * (by - oy) - (ay - oy) * (bx - ox)) < 0
 End Sub
 
+' Sets xfMode to mode and checks it. A conversion is usable when 1 mm along each model axis
+' comes out 1 mm long and square to the other two, the known point lands on the sketch plane,
+' and 1 mm along the outward normal becomes 1 mm of sketch +Z.
+Private Function TransformOK(ByVal mode As Long, ByVal px As Double, ByVal py As Double, ByVal pz As Double, _
+                             ByVal nx As Double, ByVal ny As Double, ByVal nz As Double) As Boolean
+    Dim o(1 To 3) As Double, e(1 To 3, 1 To 3) As Double, q(1 To 3) As Double, w(1 To 3) As Double
+    Dim j As Long, k As Long, s As Double, ln As Double
+    TransformOK = False
+    xfMode = mode
+    On Error GoTo NotOK
+    ToSketch 0, 0, 0, o(1), o(2), o(3)
+    ToSketch 1, 0, 0, e(1, 1), e(1, 2), e(1, 3)
+    ToSketch 0, 1, 0, e(2, 1), e(2, 2), e(2, 3)
+    ToSketch 0, 0, 1, e(3, 1), e(3, 2), e(3, 3)
+    For k = 1 To 3
+        For j = 1 To 3
+            e(k, j) = e(k, j) - o(j)
+        Next j
+    Next k
+    For k = 1 To 3
+        For j = k To 3
+            s = e(k, 1) * e(j, 1) + e(k, 2) * e(j, 2) + e(k, 3) * e(j, 3)
+            If j = k Then s = s - 0.000001        ' 1 mm is 0.001 m, so its square is 1E-6
+            If Abs(s) > 0.00000001 Then Exit Function
+        Next j
+    Next k
+    ln = Sqr(nx * nx + ny * ny + nz * nz)
+    ToSketch px, py, pz, q(1), q(2), q(3)
+    ToSketch px + nx / ln, py + ny / ln, pz + nz / ln, w(1), w(2), w(3)
+    If Abs(q(3)) > 0.000001 Then Exit Function
+    If Abs(w(1) - q(1)) > 0.00001 Or Abs(w(2) - q(2)) > 0.00001 Then Exit Function
+    If Abs(w(3) - q(3) - 0.001) > 0.00001 Then Exit Function
+    TransformOK = True
+    Exit Function
+NotOK:
+    TransformOK = False
+End Function
+
+Private Function SketchSurfaceName() As String
+    If curPlane > 0 Then SketchSurfaceName = "the " & PlaneLabel(curPlane) & " plane" Else SketchSurfaceName = "a face"
+End Function
+
+Private Function XformText() As String
+    Dim k As Long, s As String
+    s = "Transform data:"
+    For k = 0 To 12
+        s = s & " " & NumStr(xfA(k))
+    Next k
+    XformText = s & "."
+End Function
+
+' Model point in mm to sketch point in metres, by the method PrepareSketchTransform chose.
+' 0 SolidWorks MathPoint, 1 and 2 the transform matrix applied by rows or by columns,
+' 3 the fixed layout of the default plane the sketch is on.
 Private Sub ToSketch(ByVal x As Double, ByVal y As Double, ByVal z As Double, _
                      ByRef sx As Double, ByRef sy As Double, ByRef sz As Double)
     Dim d(2) As Double, vIn As Variant, mp As Object, vOut As Variant
-    d(0) = x / 1000#: d(1) = y / 1000#: d(2) = z / 1000#
-    vIn = d
-    Set mp = swMath.CreatePoint(vIn)
-    Set mp = mp.MultiplyTransform(curXform)
-    vOut = mp.ArrayData
-    sx = vOut(0): sy = vOut(1): sz = vOut(2)
-    If flatZ Then sz = 0
+    Dim mx As Double, my As Double, mz As Double, s As Double
+    mx = x / 1000#: my = y / 1000#: mz = z / 1000#
+    s = xfA(12)
+    If Abs(s) < 0.000000000001 Then s = 1
+    Select Case xfMode
+    Case 0
+        d(0) = mx: d(1) = my: d(2) = mz
+        vIn = d
+        Set mp = swMath.CreatePoint(vIn)
+        Set mp = mp.MultiplyTransform(curXform)
+        vOut = mp.ArrayData
+        sx = vOut(0): sy = vOut(1): sz = vOut(2)
+    Case 1
+        sx = (mx * xfA(0) + my * xfA(3) + mz * xfA(6)) * s + xfA(9)
+        sy = (mx * xfA(1) + my * xfA(4) + mz * xfA(7)) * s + xfA(10)
+        sz = (mx * xfA(2) + my * xfA(5) + mz * xfA(8)) * s + xfA(11)
+    Case 2
+        sx = (mx * xfA(0) + my * xfA(1) + mz * xfA(2)) * s + xfA(9)
+        sy = (mx * xfA(3) + my * xfA(4) + mz * xfA(5)) * s + xfA(10)
+        sz = (mx * xfA(6) + my * xfA(7) + mz * xfA(8)) * s + xfA(11)
+    Case Else
+        ' Front looks along -Z with +Y up, Top looks down -Y with -Z up, Right looks along -X with +Y up
+        Select Case curPlane
+        Case 1: sx = mx: sy = my: sz = mz
+        Case 2: sx = mx: sy = -mz: sz = my
+        Case Else: sx = -mz: sy = my: sz = mx
+        End Select
+    End Select
 End Sub
 
 Private Function SW_EndSketch(ByVal nm As String) As Object
@@ -1392,76 +1499,18 @@ Private Sub SW_Line(ByVal x1 As Double, ByVal y1 As Double, ByVal z1 As Double, 
     End If
     ToSketch x1, y1, z1, a, b, c
     ToSketch x2, y2, z2, d, e, f
-    If Not swModel.SketchManager.CreateLine(a, b, c, d, e, f) Is Nothing Then Exit Sub
-    If LineWithRecovery(x1, y1, z1, x2, y2, z2) Then Exit Sub
-    Err.Raise ERR_STEM + 24, , "A sketch line could not be created, from (" & P3(x1, y1, z1) & ") to (" & _
-        P3(x2, y2, z2) & ") mm, " & NumStr(Sqr((x2 - x1) ^ 2 + (y2 - y1) ^ 2 + (z2 - z1) ^ 2)) & _
-        " mm long. The four fixes in the log above did not help."
-End Sub
-
-' Runs when a line cannot be created. The likely causes are fixed one at a time, each followed by
-' another try, and the log records the sketch state and the result of every fix. Fixes add up,
-' and the ones applied stay in force for the rest of the run.
-Private Function LineWithRecovery(ByVal x1 As Double, ByVal y1 As Double, ByVal z1 As Double, _
-                                  ByVal x2 As Double, ByVal y2 As Double, ByVal z2 As Double) As Boolean
-    Dim stage As Long, fixName As String, errs As Long
-    Dim a As Double, b As Double, c As Double, d As Double, e As Double, f As Double
-    LineWithRecovery = False
-    ToSketch x1, y1, z1, a, b, c
-    ToSketch x2, y2, z2, d, e, f
-    WriteLog "  Line from (" & P3(x1, y1, z1) & ") to (" & P3(x2, y2, z2) & ") mm not created. In sketch space (" & _
-        P3(a, b, c) & ") to (" & P3(d, e, f) & ") m. " & SketchState() & " " & SketchContext()
-    For stage = 1 To 4
-        On Error Resume Next
-        Select Case stage
-        Case 1
-            fixName = "made the part the active document and turned the feature tree and graphics back on"
-            swApp.ActivateDoc3 swModel.GetTitle, False, 0, errs
-            keepViewOn = True
-            swModel.FeatureManager.EnableFeatureTree = True
-            swModel.ActiveView.EnableGraphicsUpdate = True
-            ForceAddToDB
-        Case 2
-            fixName = "closed the empty sketch and opened a new one with the plane picked by name"
-            planeByName = True
-            If curPlane > 0 And SegmentCount() = 0 Then ReopenSketch
-        Case 3
-            fixName = "put the points exactly on the sketch plane (sketch z = 0)"
-            flatZ = True
-        Case 4
-            fixName = "switched AddToDB off"
-            noAddToDB = True
-            ForceAddToDB
-        End Select
-        Err.Clear
-        On Error GoTo 0
-        ToSketch x1, y1, z1, a, b, c
-        ToSketch x2, y2, z2, d, e, f
-        If Not swModel.SketchManager.CreateLine(a, b, c, d, e, f) Is Nothing Then
-            WriteLog "  Fix " & stage & " worked, it " & fixName & ". Fixes 1 to " & stage & " stay on for the rest of the run."
-            LineWithRecovery = True
-            Exit Function
-        End If
-        WriteLog "  Fix " & stage & " did not help, it " & fixName & ". " & SketchState() & " " & SketchContext()
-    Next stage
-End Function
-
-' Closes the open sketch, deletes it if SolidWorks kept it, and opens a new one on the same plane.
-Private Sub ReopenSketch()
-    swModel.SketchManager.InsertSketch True
-    SW_DeleteBackTo sketchStartCount
-    If Not SelectPlane(curPlane) Then Err.Raise ERR_STEM + 29, , "The " & PlaneLabel(curPlane) & " plane could not be selected. " & planeSelInfo
-    swModel.SketchManager.InsertSketch True
-    PrepareSketchTransform
+    If swModel.SketchManager.CreateLine(a, b, c, d, e, f) Is Nothing Then Err.Raise ERR_STEM + 24, , _
+        "A sketch line could not be created, from (" & P3(x1, y1, z1) & ") to (" & P3(x2, y2, z2) & ") mm, " & _
+        "in sketch space (" & P3(a * 1000#, b * 1000#, c * 1000#) & ") to (" & P3(d * 1000#, e * 1000#, f * 1000#) & _
+        ") mm. " & SketchState() & " " & SketchContext()
 End Sub
 
 ' Entities must go straight into the sketch, or SolidWorks snaps short ones onto nearby
-' endpoints and returns Nothing. Some versions reset this flag when a sketch opens, so it is
-' set again inside every sketch.
+' endpoints. The flag is set again inside every sketch in case SolidWorks resets it.
 Private Sub ForceAddToDB()
     On Error Resume Next
-    swModel.SketchManager.AddToDB = Not noAddToDB
-    swModel.SketchManager.DisplayWhenAdded = keepViewOn
+    swModel.SketchManager.AddToDB = True
+    swModel.SketchManager.DisplayWhenAdded = False
     On Error GoTo 0
 End Sub
 
@@ -1492,7 +1541,7 @@ Private Function SketchState() As String
     SketchState = s
 End Function
 
-' Which document is active and how the sketch plane was picked.
+' Which document is active, how the sketch plane was picked and how points are converted.
 Private Function SketchContext() As String
     Dim s As String, ad As Object
     On Error Resume Next
@@ -1504,7 +1553,7 @@ Private Function SketchContext() As String
     Else
         s = "The active document is '" & ad.GetTitle & "', the part is '" & swModel.GetTitle & "'."
     End If
-    s = s & " Sketch plane: " & planeSelInfo
+    s = s & " Sketch plane: " & planeSelInfo & " Transform method " & xfMode & "."
     On Error GoTo 0
     SketchContext = s
 End Function
@@ -1535,11 +1584,9 @@ Private Sub SW_Arc(ByVal cx As Double, ByVal cy As Double, ByVal cz As Double, _
     ToSketch x1, y1, z1, d, e, f
     ToSketch x2, y2, z2, g, h, i
     If curArcFlip Then dirv = -dirv
-    If Not swModel.SketchManager.CreateArc(a, b, c, d, e, f, g, h, i, dirv) Is Nothing Then Exit Sub
-    ForceAddToDB
-    If Not swModel.SketchManager.CreateArc(a, b, c, d, e, f, g, h, i, dirv) Is Nothing Then Exit Sub
-    Err.Raise ERR_STEM + 26, , "A sketch arc could not be created, centre (" & P3(cx, cy, cz) & "), from (" & _
-        P3(x1, y1, z1) & ") to (" & P3(x2, y2, z2) & ") mm. " & SketchState()
+    If swModel.SketchManager.CreateArc(a, b, c, d, e, f, g, h, i, dirv) Is Nothing Then Err.Raise ERR_STEM + 26, , _
+        "A sketch arc could not be created, centre (" & P3(cx, cy, cz) & "), from (" & P3(x1, y1, z1) & ") to (" & _
+        P3(x2, y2, z2) & ") mm. " & SketchState() & " " & SketchContext()
 End Sub
 
 Private Sub SW_Circle(ByVal cx As Double, ByVal cy As Double, ByVal cz As Double, ByVal r As Double)
