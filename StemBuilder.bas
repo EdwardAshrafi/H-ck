@@ -1305,6 +1305,7 @@ Private Sub PrepareSketchTransform()
     Dim bx As Double, by As Double, bz As Double
     Set curSketch = swModel.SketchManager.ActiveSketch
     If curSketch Is Nothing Then Err.Raise ERR_STEM + 23, , "No active sketch after InsertSketch."
+    ForceAddToDB
     Set curXform = curSketch.ModelToSketchTransform
     ToSketch 0, 0, 0, ox, oy, oz
     ToSketch 1, 0, 0, ax, ay, az
@@ -1347,8 +1348,43 @@ Private Sub SW_Line(ByVal x1 As Double, ByVal y1 As Double, ByVal z1 As Double, 
     End If
     ToSketch x1, y1, z1, a, b, c
     ToSketch x2, y2, z2, d, e, f
-    If swModel.SketchManager.CreateLine(a, b, c, d, e, f) Is Nothing Then Err.Raise ERR_STEM + 24, , "A sketch line could not be created."
+    If Not swModel.SketchManager.CreateLine(a, b, c, d, e, f) Is Nothing Then Exit Sub
+    ' Retry once with snapping switched off again, in case SolidWorks reset it.
+    ForceAddToDB
+    If Not swModel.SketchManager.CreateLine(a, b, c, d, e, f) Is Nothing Then Exit Sub
+    Err.Raise ERR_STEM + 24, , "A sketch line could not be created, from (" & P3(x1, y1, z1) & ") to (" & _
+        P3(x2, y2, z2) & ") mm, " & NumStr(Sqr((x2 - x1) ^ 2 + (y2 - y1) ^ 2 + (z2 - z1) ^ 2)) & " mm long. " & SketchState()
 End Sub
+
+' Entities must go straight into the sketch, or SolidWorks snaps short ones onto nearby
+' endpoints and returns Nothing. Some versions reset this flag when a sketch opens, so it is
+' set again inside every sketch.
+Private Sub ForceAddToDB()
+    On Error Resume Next
+    swModel.SketchManager.AddToDB = True
+    swModel.SketchManager.DisplayWhenAdded = False
+    On Error GoTo 0
+End Sub
+
+' One line for the log about the open sketch, so a failed entity can be traced.
+Private Function SketchState() As String
+    Dim s As String, sk As Object, segs As Variant
+    On Error Resume Next
+    Set sk = swModel.SketchManager.ActiveSketch
+    If sk Is Nothing Then
+        s = "No sketch is open."
+    Else
+        segs = sk.GetSketchSegments
+        If IsEmpty(segs) Then
+            s = "The open sketch has 0 segments"
+        Else
+            s = "The open sketch has " & (UBound(segs) + 1) & " segments"
+        End If
+        s = s & ", AddToDB is " & swModel.SketchManager.AddToDB & "."
+    End If
+    On Error GoTo 0
+    SketchState = s
+End Function
 
 Private Sub SW_CenterLine(ByVal x1 As Double, ByVal y1 As Double, ByVal z1 As Double, _
                           ByVal x2 As Double, ByVal y2 As Double, ByVal z2 As Double)
@@ -1376,7 +1412,11 @@ Private Sub SW_Arc(ByVal cx As Double, ByVal cy As Double, ByVal cz As Double, _
     ToSketch x1, y1, z1, d, e, f
     ToSketch x2, y2, z2, g, h, i
     If curArcFlip Then dirv = -dirv
-    If swModel.SketchManager.CreateArc(a, b, c, d, e, f, g, h, i, dirv) Is Nothing Then Err.Raise ERR_STEM + 26, , "A sketch arc could not be created."
+    If Not swModel.SketchManager.CreateArc(a, b, c, d, e, f, g, h, i, dirv) Is Nothing Then Exit Sub
+    ForceAddToDB
+    If Not swModel.SketchManager.CreateArc(a, b, c, d, e, f, g, h, i, dirv) Is Nothing Then Exit Sub
+    Err.Raise ERR_STEM + 26, , "A sketch arc could not be created, centre (" & P3(cx, cy, cz) & "), from (" & _
+        P3(x1, y1, z1) & ") to (" & P3(x2, y2, z2) & ") mm. " & SketchState()
 End Sub
 
 Private Sub SW_Circle(ByVal cx As Double, ByVal cy As Double, ByVal cz As Double, ByVal r As Double)
