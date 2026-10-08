@@ -103,6 +103,8 @@ Private currentKind As Long, currentDUni As Double
 Private swApp As Object, swModel As Object, swMath As Object
 Private planeFront As Object, planeTop As Object, planeRight As Object
 Private curSketch As Object, curXform As Object, curArcFlip As Boolean
+Private curPlane As Long, sketchStartCount As Long, planeSelInfo As String
+Private keepViewOn As Boolean, planeByName As Boolean, flatZ As Boolean, noAddToDB As Boolean
 Private lastFeat As Object, lastCenterline As Object
 Private offCombo(1 To 3) As Long
 Private TestMode As Boolean, testFile As Integer
@@ -121,6 +123,7 @@ Sub main()
     Set swApp = Application.SldWorks
     Set swMath = swApp.GetMathUtility
     SetupOutput
+    WriteLog "SolidWorks revision " & swApp.RevisionNumber & "."
     t0 = Timer
     InitGeometry
     WriteLog "Geometry ready in " & Format(Timer - t0, "0.0") & " s. ISO tilt " & Format(isoTheta, "0.000") & _
@@ -1190,10 +1193,12 @@ Private Sub SW_NewPart()
     If swModel Is Nothing Then Err.Raise ERR_STEM + 21, , "SolidWorks could not open a new part from " & tpl
     FindDefaultPlanes
     On Error Resume Next
-    swModel.SketchManager.AddToDB = True
-    swModel.SketchManager.DisplayWhenAdded = False
-    swModel.FeatureManager.EnableFeatureTree = False
-    swModel.ActiveView.EnableGraphicsUpdate = False
+    swModel.SketchManager.AddToDB = Not noAddToDB
+    swModel.SketchManager.DisplayWhenAdded = keepViewOn
+    If Not keepViewOn Then
+        swModel.FeatureManager.EnableFeatureTree = False
+        swModel.ActiveView.EnableGraphicsUpdate = False
+    End If
     On Error GoTo 0
 End Sub
 
@@ -1251,15 +1256,50 @@ Private Sub SW_BeginSketchPlane(ByVal which As Long)
         Rec "SKETCH," & Choose(which, "FRONT", "TOP", "RIGHT")
         Exit Sub
     End If
-    swModel.ClearSelection2 True
-    Select Case which
-    Case 1: planeFront.Select2 False, 0
-    Case 2: planeTop.Select2 False, 0
-    Case Else: planeRight.Select2 False, 0
-    End Select
+    curPlane = which
+    sketchStartCount = swModel.GetFeatureCount
+    If Not SelectPlane(which) Then Err.Raise ERR_STEM + 29, , "The " & PlaneLabel(which) & " plane could not be selected. " & planeSelInfo
     swModel.SketchManager.InsertSketch True
     PrepareSketchTransform
 End Sub
+
+Private Function PlaneObj(ByVal which As Long) As Object
+    Select Case which
+    Case 1: Set PlaneObj = planeFront
+    Case 2: Set PlaneObj = planeTop
+    Case Else: Set PlaneObj = planeRight
+    End Select
+End Function
+
+Private Function PlaneLabel(ByVal which As Long) As String
+    PlaneLabel = Choose(which, "Front", "Top", "Right")
+End Function
+
+' Selects a default plane and checks that something really is selected. Picking the plane by
+' name is the fallback, and becomes the first choice once it has been needed.
+Private Function SelectPlane(ByVal which As Long) As Boolean
+    Dim p As Object, ok As Boolean, nSel As Long
+    Set p = PlaneObj(which)
+    ok = False: planeSelInfo = ""
+    On Error Resume Next
+    swModel.ClearSelection2 True
+    If Not planeByName Then
+        ok = p.Select2(False, 0)
+        nSel = swModel.SelectionManager.GetSelectedObjectCount2(-1)
+        planeSelInfo = "'" & p.Name & "' Select2 gave " & ok & " with " & nSel & " selected."
+        ok = ok And nSel > 0
+    End If
+    If Not ok Then
+        swModel.ClearSelection2 True
+        ok = swModel.Extension.SelectByID2(p.Name, "PLANE", 0, 0, 0, False, 0, Nothing, 0)
+        nSel = swModel.SelectionManager.GetSelectedObjectCount2(-1)
+        planeSelInfo = planeSelInfo & " '" & p.Name & "' SelectByID2 gave " & ok & " with " & nSel & " selected."
+        ok = ok And nSel > 0
+    End If
+    Err.Clear
+    On Error GoTo 0
+    SelectPlane = ok
+End Function
 
 ' Opens a sketch on the face through (x, y, z). (dx, dy, dz) is the direction of a ray that meets
 ' the face square on from outside the part.
@@ -1270,6 +1310,9 @@ Private Function SW_BeginSketchOnFace(ByVal x As Double, ByVal y As Double, ByVa
         SW_BeginSketchOnFace = True
         Exit Function
     End If
+    curPlane = 0
+    sketchStartCount = swModel.GetFeatureCount
+    planeSelInfo = "a face of the part."
     swModel.ClearSelection2 True
     If Not SelectFace(x, y, z, dx, dy, dz, False, 0) Then
         SW_BeginSketchOnFace = False
@@ -1322,6 +1365,7 @@ Private Sub ToSketch(ByVal x As Double, ByVal y As Double, ByVal z As Double, _
     Set mp = mp.MultiplyTransform(curXform)
     vOut = mp.ArrayData
     sx = vOut(0): sy = vOut(1): sz = vOut(2)
+    If flatZ Then sz = 0
 End Sub
 
 Private Function SW_EndSketch(ByVal nm As String) As Object
@@ -1349,11 +1393,66 @@ Private Sub SW_Line(ByVal x1 As Double, ByVal y1 As Double, ByVal z1 As Double, 
     ToSketch x1, y1, z1, a, b, c
     ToSketch x2, y2, z2, d, e, f
     If Not swModel.SketchManager.CreateLine(a, b, c, d, e, f) Is Nothing Then Exit Sub
-    ' Retry once with snapping switched off again, in case SolidWorks reset it.
-    ForceAddToDB
-    If Not swModel.SketchManager.CreateLine(a, b, c, d, e, f) Is Nothing Then Exit Sub
+    If LineWithRecovery(x1, y1, z1, x2, y2, z2) Then Exit Sub
     Err.Raise ERR_STEM + 24, , "A sketch line could not be created, from (" & P3(x1, y1, z1) & ") to (" & _
-        P3(x2, y2, z2) & ") mm, " & NumStr(Sqr((x2 - x1) ^ 2 + (y2 - y1) ^ 2 + (z2 - z1) ^ 2)) & " mm long. " & SketchState()
+        P3(x2, y2, z2) & ") mm, " & NumStr(Sqr((x2 - x1) ^ 2 + (y2 - y1) ^ 2 + (z2 - z1) ^ 2)) & _
+        " mm long. The four fixes in the log above did not help."
+End Sub
+
+' Runs when a line cannot be created. The likely causes are fixed one at a time, each followed by
+' another try, and the log records the sketch state and the result of every fix. Fixes add up,
+' and the ones applied stay in force for the rest of the run.
+Private Function LineWithRecovery(ByVal x1 As Double, ByVal y1 As Double, ByVal z1 As Double, _
+                                  ByVal x2 As Double, ByVal y2 As Double, ByVal z2 As Double) As Boolean
+    Dim stage As Long, fixName As String, errs As Long
+    Dim a As Double, b As Double, c As Double, d As Double, e As Double, f As Double
+    LineWithRecovery = False
+    ToSketch x1, y1, z1, a, b, c
+    ToSketch x2, y2, z2, d, e, f
+    WriteLog "  Line from (" & P3(x1, y1, z1) & ") to (" & P3(x2, y2, z2) & ") mm not created. In sketch space (" & _
+        P3(a, b, c) & ") to (" & P3(d, e, f) & ") m. " & SketchState() & " " & SketchContext()
+    For stage = 1 To 4
+        On Error Resume Next
+        Select Case stage
+        Case 1
+            fixName = "made the part the active document and turned the feature tree and graphics back on"
+            swApp.ActivateDoc3 swModel.GetTitle, False, 0, errs
+            keepViewOn = True
+            swModel.FeatureManager.EnableFeatureTree = True
+            swModel.ActiveView.EnableGraphicsUpdate = True
+            ForceAddToDB
+        Case 2
+            fixName = "closed the empty sketch and opened a new one with the plane picked by name"
+            planeByName = True
+            If curPlane > 0 And SegmentCount() = 0 Then ReopenSketch
+        Case 3
+            fixName = "put the points exactly on the sketch plane (sketch z = 0)"
+            flatZ = True
+        Case 4
+            fixName = "switched AddToDB off"
+            noAddToDB = True
+            ForceAddToDB
+        End Select
+        Err.Clear
+        On Error GoTo 0
+        ToSketch x1, y1, z1, a, b, c
+        ToSketch x2, y2, z2, d, e, f
+        If Not swModel.SketchManager.CreateLine(a, b, c, d, e, f) Is Nothing Then
+            WriteLog "  Fix " & stage & " worked, it " & fixName & ". Fixes 1 to " & stage & " stay on for the rest of the run."
+            LineWithRecovery = True
+            Exit Function
+        End If
+        WriteLog "  Fix " & stage & " did not help, it " & fixName & ". " & SketchState() & " " & SketchContext()
+    Next stage
+End Function
+
+' Closes the open sketch, deletes it if SolidWorks kept it, and opens a new one on the same plane.
+Private Sub ReopenSketch()
+    swModel.SketchManager.InsertSketch True
+    SW_DeleteBackTo sketchStartCount
+    If Not SelectPlane(curPlane) Then Err.Raise ERR_STEM + 29, , "The " & PlaneLabel(curPlane) & " plane could not be selected. " & planeSelInfo
+    swModel.SketchManager.InsertSketch True
+    PrepareSketchTransform
 End Sub
 
 ' Entities must go straight into the sketch, or SolidWorks snaps short ones onto nearby
@@ -1361,29 +1460,53 @@ End Sub
 ' set again inside every sketch.
 Private Sub ForceAddToDB()
     On Error Resume Next
-    swModel.SketchManager.AddToDB = True
-    swModel.SketchManager.DisplayWhenAdded = False
+    swModel.SketchManager.AddToDB = Not noAddToDB
+    swModel.SketchManager.DisplayWhenAdded = keepViewOn
     On Error GoTo 0
 End Sub
 
-' One line for the log about the open sketch, so a failed entity can be traced.
-Private Function SketchState() As String
-    Dim s As String, sk As Object, segs As Variant
+' Segments in the open sketch, or -1 when no sketch is open.
+Private Function SegmentCount() As Long
+    Dim sk As Object, segs As Variant
+    SegmentCount = -1
     On Error Resume Next
     Set sk = swModel.SketchManager.ActiveSketch
-    If sk Is Nothing Then
+    If sk Is Nothing Then Exit Function
+    segs = sk.GetSketchSegments
+    If IsEmpty(segs) Then SegmentCount = 0 Else SegmentCount = UBound(segs) + 1
+    On Error GoTo 0
+End Function
+
+' One line for the log about the open sketch, so a failed entity can be traced.
+Private Function SketchState() As String
+    Dim n As Long, s As String
+    n = SegmentCount()
+    If n < 0 Then
         s = "No sketch is open."
     Else
-        segs = sk.GetSketchSegments
-        If IsEmpty(segs) Then
-            s = "The open sketch has 0 segments"
-        Else
-            s = "The open sketch has " & (UBound(segs) + 1) & " segments"
-        End If
+        s = "The open sketch has " & n & " segments"
+        On Error Resume Next
         s = s & ", AddToDB is " & swModel.SketchManager.AddToDB & "."
+        On Error GoTo 0
     End If
-    On Error GoTo 0
     SketchState = s
+End Function
+
+' Which document is active and how the sketch plane was picked.
+Private Function SketchContext() As String
+    Dim s As String, ad As Object
+    On Error Resume Next
+    Set ad = swApp.ActiveDoc
+    If ad Is Nothing Then
+        s = "SolidWorks reports no active document."
+    ElseIf ad.GetTitle = swModel.GetTitle Then
+        s = "The part is the active document."
+    Else
+        s = "The active document is '" & ad.GetTitle & "', the part is '" & swModel.GetTitle & "'."
+    End If
+    s = s & " Sketch plane: " & planeSelInfo
+    On Error GoTo 0
+    SketchContext = s
 End Function
 
 Private Sub SW_CenterLine(ByVal x1 As Double, ByVal y1 As Double, ByVal z1 As Double, _
